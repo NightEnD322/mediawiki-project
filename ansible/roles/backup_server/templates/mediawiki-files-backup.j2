@@ -1,76 +1,162 @@
 #!/usr/bin/env bash
+
+# Останавливать выполнение при первой ошибке.
+# -E — обработчик ERR наследуется функциями и вложенными командами.
+# -e — завершать скрипт при ненулевом коде команды.
+# -u — считать обращение к необъявленной переменной ошибкой.
+# -o pipefail — считать ошибкой сбой любой команды внутри конвейера.
 set -Eeuo pipefail
+
+# Новые файлы будут доступны только владельцу.
+# Итоговые резервные копии создаются с правами 0600.
 umask 077
 
+# Параметры резервного копирования.
+#
+# Каждый параметр можно переопределить аргументом командной строки:
+#   $1 — сервер, с которого копируются файлы;
+#   $2 — исходный каталог MediaWiki;
+#   $3 — локальный каталог для хранения архивов;
+#   $4 — срок хранения архивов в днях.
+#
+# Если аргумент не указан, используются значения из Ansible.
 SOURCE_HOST="${1:-{{ backup_files_source_host }}}"
 SOURCE_DIR="${2:-{{ backup_files_source_directory }}}"
 BACKUP_DIR="${3:-{{ backup_files_directory }}}"
 RETENTION_DAYS="${4:-{{ backup_retention_days }}}"
 
+# Параметры SSH-подключения к серверу приложения.
+#
+# Закрытый ключ создаётся и устанавливается ролью backup_server.
+# Файл known_hosts также формируется Ansible из ключей целевых серверов.
 SSH_KEY="{{ backup_ssh_key }}"
 KNOWN_HOSTS="{{ backup_known_hosts }}"
+SSH_USER="{{ backup_ssh_user }}"
+
+# В эту переменную будет записан путь временного файла.
+# Она нужна для гарантированной очистки при ошибке.
 TEMP_FILE=""
 
+# Вывод краткой справки по использованию скрипта.
 usage() {
     echo "Использование: sudo $0 [SOURCE_HOST] [SOURCE_DIR] [BACKUP_DIR] [RETENTION_DAYS]"
 }
 
+# Вывод сообщения с текущими датой и временем.
 log() {
     printf '%s %s\n' "$(date '+%F %T')" "$*"
 }
 
+# Вывод сообщения об ошибке и завершение работы.
 fail() {
     echo "ОШИБКА: $*" >&2
     exit 1
 }
 
+# Удаление незавершённого временного архива.
+#
+# Функция вызывается при любом завершении скрипта благодаря trap EXIT.
+# Готовый архив она не удалит, потому что после успешного mv
+# переменная TEMP_FILE очищается.
 cleanup() {
     if [[ -n "$TEMP_FILE" && -f "$TEMP_FILE" ]]; then
         rm -f -- "$TEMP_FILE"
     fi
 }
 
+# Обработчик непредвиденной ошибки.
+#
+# Первый аргумент — номер строки, на которой произошёл сбой.
+# Код завершения исходной команды сохраняется и возвращается вызывающей системе.
 on_error() {
     local exit_code=$?
     echo "ОШИБКА: сбой на строке $1, код завершения $exit_code" >&2
     exit "$exit_code"
 }
 
+# Показать справку по ключам -h или --help.
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     usage
     exit 0
 fi
 
+# Скрипт принимает не более четырёх позиционных аргументов.
 if (( $# > 4 )); then
     usage >&2
     exit 2
 fi
 
+# Зарегистрировать обработчики очистки и ошибок.
 trap cleanup EXIT
 trap 'on_error "$LINENO"' ERR
 
+# Резервное копирование должно запускаться от root,
+# потому что архив записывается в защищённый каталог,
+# а удалённая команда использует sudo.
 [[ "$EUID" -eq 0 ]] || fail "запусти скрипт через sudo"
-[[ "$SOURCE_HOST" =~ ^[A-Za-z0-9._-]+$ ]] || fail "неверный адрес SOURCE_HOST"
-[[ "$SOURCE_DIR" == /* && "$SOURCE_DIR" != "/" ]] || fail "SOURCE_DIR должен быть абсолютным путём к каталогу"
-[[ "$BACKUP_DIR" == /* ]] || fail "BACKUP_DIR должен быть абсолютным путём"
-[[ "$RETENTION_DAYS" =~ ^[0-9]+$ ]] || fail "RETENTION_DAYS должен быть целым числом"
-[[ -r "$SSH_KEY" ]] || fail "не найден SSH-ключ: $SSH_KEY"
-[[ -r "$KNOWN_HOSTS" ]] || fail "не найден файл known_hosts: $KNOWN_HOSTS"
 
+# Проверить допустимые символы в имени или IP-адресе сервера.
+[[ "$SOURCE_HOST" =~ ^[A-Za-z0-9._-]+$ ]] ||
+    fail "неверный адрес SOURCE_HOST"
+
+# Исходный каталог должен быть абсолютным путём.
+# Архивирование корня файловой системы запрещено защитной проверкой.
+[[ "$SOURCE_DIR" == /* && "$SOURCE_DIR" != "/" ]] ||
+    fail "SOURCE_DIR должен быть абсолютным путём к каталогу"
+
+# Каталог резервных копий также должен быть абсолютным путём.
+[[ "$BACKUP_DIR" == /* ]] ||
+    fail "BACKUP_DIR должен быть абсолютным путём"
+
+# Срок хранения должен быть целым неотрицательным числом.
+[[ "$RETENTION_DAYS" =~ ^[0-9]+$ ]] ||
+    fail "RETENTION_DAYS должен быть целым числом"
+
+# Проверить наличие SSH-ключа и файла известных серверов.
+[[ -r "$SSH_KEY" ]] ||
+    fail "не найден SSH-ключ: $SSH_KEY"
+
+[[ -r "$KNOWN_HOSTS" ]] ||
+    fail "не найден файл known_hosts: $KNOWN_HOSTS"
+
+# Создать каталог резервных копий, если он ещё не существует.
 mkdir -p -- "$BACKUP_DIR"
 
+# Добавить дату и время создания в имя архива.
 timestamp="$(date '+%Y-%m-%d_%H-%M-%S')"
 archive="$BACKUP_DIR/mediawiki-files-$timestamp.tar.gz"
+
+# Сначала данные записываются во временный файл.
+# Благодаря этому незавершённый архив не получит имя готовой копии.
 TEMP_FILE="$(mktemp "$BACKUP_DIR/.mediawiki-files.XXXXXX")"
 
+# Разделить исходный путь на родительский каталог и имя каталога.
+#
+# Например:
+#   SOURCE_DIR=/var/www/mediawiki
+#   source_parent=/var/www
+#   source_name=mediawiki
 source_parent="$(dirname -- "$SOURCE_DIR")"
 source_name="$(basename -- "$SOURCE_DIR")"
+
+# Безопасно экранировать значения перед передачей удалённой оболочке.
 remote_parent="$(printf '%q' "$source_parent")"
 remote_name="$(printf '%q' "$source_name")"
+
+# Удалённая команда создаёт gzip-архив и отправляет его в стандартный вывод.
+#
+# --numeric-owner сохраняет числовые UID и GID.
+# Архив не создаётся на app-сервере: его поток сразу передаётся на edge.
 remote_command="sudo -n tar --numeric-owner -C $remote_parent -czf - -- $remote_name"
 
 log "Создаю архив $SOURCE_DIR с сервера $SOURCE_HOST"
 
+# Подключиться к серверу приложения и записать поток tar в временный файл.
+#
+# BatchMode запрещает интерактивный запрос пароля.
+# IdentitiesOnly разрешает использовать только указанный ключ.
+# StrictHostKeyChecking защищает от подключения к неизвестному серверу.
+# ConnectTimeout ограничивает время ожидания SSH-соединения.
 ssh \
     -i "$SSH_KEY" \
     -o BatchMode=yes \
@@ -78,15 +164,27 @@ ssh \
     -o UserKnownHostsFile="$KNOWN_HOSTS" \
     -o StrictHostKeyChecking=yes \
     -o ConnectTimeout=10 \
-    "{{ backup_ssh_user }}@$SOURCE_HOST" "$remote_command" > "$TEMP_FILE"
+    "$SSH_USER@$SOURCE_HOST" "$remote_command" > "$TEMP_FILE"
 
+# Убедиться, что полученный архив не пустой.
 [[ -s "$TEMP_FILE" ]] || fail "архив получился пустым"
+
+# Проверить целостность gzip-потока без распаковки файлов.
 gzip -t "$TEMP_FILE"
 
+# После успешной проверки переименовать временный файл
+# в окончательный архив.
 mv -- "$TEMP_FILE" "$archive"
 TEMP_FILE=""
 
-find "$BACKUP_DIR" -type f -name 'mediawiki-files-*.tar.gz' \
-    -mtime "+$RETENTION_DAYS" -delete
+# Удалить архивы старше установленного срока хранения.
+#
+# Ограничение по имени не позволяет удалить посторонние файлы
+# из каталога резервного копирования.
+find "$BACKUP_DIR" \
+    -type f \
+    -name 'mediawiki-files-*.tar.gz' \
+    -mtime "+$RETENTION_DAYS" \
+    -delete
 
 log "Готово: $archive"

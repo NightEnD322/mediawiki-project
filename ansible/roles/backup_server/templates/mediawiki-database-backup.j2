@@ -1,72 +1,156 @@
 #!/usr/bin/env bash
+
+# Строгий режим выполнения:
+# -E — обработчик ERR наследуется функциями и вложенными командами;
+# -e — завершать работу при ошибке команды;
+# -u — считать необъявленные переменные ошибкой;
+# -o pipefail — учитывать ошибки всех команд в конвейере.
 set -Eeuo pipefail
+
+# Создаваемые файлы доступны только владельцу.
+# Готовые дампы будут иметь права 0600.
 umask 077
 
+# Параметры резервного копирования.
+#
+# Их можно переопределить позиционными аргументами:
+#   $1 — адрес PostgreSQL primary;
+#   $2 — имя базы данных MediaWiki;
+#   $3 — каталог хранения резервных копий;
+#   $4 — срок хранения копий в днях.
+#
+# Значения по умолчанию подставляются Ansible при создании скрипта.
 DB_HOST="${1:-{{ backup_database_host }}}"
 DB_NAME="${2:-{{ backup_database_name }}}"
 BACKUP_DIR="${3:-{{ backup_database_directory }}}"
 RETENTION_DAYS="${4:-{{ backup_retention_days }}}"
 
+# Параметры подключения к серверу базы данных.
 SSH_KEY="{{ backup_ssh_key }}"
 KNOWN_HOSTS="{{ backup_known_hosts }}"
+SSH_USER="{{ backup_ssh_user }}"
+
+# Путь к временному каталогу.
+# В нём дампы хранятся до завершения всех проверок.
 TEMP_DIR=""
 
+# Вывести справку по использованию скрипта.
 usage() {
     echo "Использование: sudo $0 [DB_HOST] [DB_NAME] [BACKUP_DIR] [RETENTION_DAYS]"
 }
 
+# Вывести сообщение с текущей датой и временем.
 log() {
     printf '%s %s\n' "$(date '+%F %T')" "$*"
 }
 
+# Вывести сообщение об ошибке и завершить работу.
 fail() {
     echo "ОШИБКА: $*" >&2
     exit 1
 }
 
+# Удалить временный каталог при завершении скрипта.
+#
+# Это выполняется как после успеха, так и после ошибки.
+# После успешного перемещения файлов TEMP_DIR очищается,
+# поэтому готовые резервные копии не удаляются.
 cleanup() {
     if [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" ]]; then
         rm -rf -- "$TEMP_DIR"
     fi
 }
 
+# Обработчик непредвиденной ошибки.
+#
+# Показывает номер строки и сохраняет исходный код завершения.
 on_error() {
     local exit_code=$?
     echo "ОШИБКА: сбой на строке $1, код завершения $exit_code" >&2
     exit "$exit_code"
 }
 
+# Показать справку по ключам -h или --help.
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     usage
     exit 0
 fi
 
+# Разрешено передать не более четырёх аргументов.
 if (( $# > 4 )); then
     usage >&2
     exit 2
 fi
 
+# Зарегистрировать функции очистки и обработки ошибок.
 trap cleanup EXIT
 trap 'on_error "$LINENO"' ERR
 
+# Скрипт должен запускаться от root:
+# резервные копии находятся в защищённом каталоге,
+# а подключение к PostgreSQL выполняется через удалённый sudo.
 [[ "$EUID" -eq 0 ]] || fail "запусти скрипт через sudo"
-[[ "$DB_HOST" =~ ^[A-Za-z0-9._-]+$ ]] || fail "неверный адрес DB_HOST"
-[[ "$DB_NAME" =~ ^[A-Za-z0-9_.-]+$ ]] || fail "неверное имя DB_NAME"
-[[ "$BACKUP_DIR" == /* ]] || fail "BACKUP_DIR должен быть абсолютным путём"
-[[ "$RETENTION_DAYS" =~ ^[0-9]+$ ]] || fail "RETENTION_DAYS должен быть целым числом"
-[[ -r "$SSH_KEY" ]] || fail "не найден SSH-ключ: $SSH_KEY"
-[[ -r "$KNOWN_HOSTS" ]] || fail "не найден файл known_hosts: $KNOWN_HOSTS"
 
+# Проверить формат адреса сервера PostgreSQL.
+[[ "$DB_HOST" =~ ^[A-Za-z0-9._-]+$ ]] ||
+    fail "неверный адрес DB_HOST"
+
+# Проверить формат имени базы данных.
+[[ "$DB_NAME" =~ ^[A-Za-z0-9_.-]+$ ]] ||
+    fail "неверное имя DB_NAME"
+
+# Каталог резервных копий должен задаваться абсолютным путём.
+[[ "$BACKUP_DIR" == /* ]] ||
+    fail "BACKUP_DIR должен быть абсолютным путём"
+
+# Срок хранения должен быть целым неотрицательным числом.
+[[ "$RETENTION_DAYS" =~ ^[0-9]+$ ]] ||
+    fail "RETENTION_DAYS должен быть целым числом"
+
+# Проверить наличие закрытого SSH-ключа.
+[[ -r "$SSH_KEY" ]] ||
+    fail "не найден SSH-ключ: $SSH_KEY"
+
+# Проверить наличие файла доверенных SSH-ключей серверов.
+[[ -r "$KNOWN_HOSTS" ]] ||
+    fail "не найден файл known_hosts: $KNOWN_HOSTS"
+
+# Создать каталог резервных копий, если он отсутствует.
 mkdir -p -- "$BACKUP_DIR"
 
+# Сформировать отметку времени и имена итоговых файлов.
 timestamp="$(date '+%Y-%m-%d_%H-%M-%S')"
+
+# Дамп рабочей базы создаётся в custom-формате PostgreSQL.
+# Такой формат поддерживает выборочное и параллельное восстановление.
 dump_archive="$BACKUP_DIR/mediawiki-db-$timestamp.dump"
+
+# Отдельно сохраняются глобальные объекты PostgreSQL:
+# роли и их свойства.
 globals_archive="$BACKUP_DIR/mediawiki-globals-$timestamp.sql"
+
+# Создать временный каталог внутри каталога резервных копий.
+# Готовые имена файлы получат только после успешной проверки.
 TEMP_DIR="$(mktemp -d "$BACKUP_DIR/.mediawiki-db.XXXXXX")"
 
+# Команда создания дампа базы данных.
+#
+# cd /tmp предотвращает предупреждение PostgreSQL о невозможности
+# перейти в домашний каталог пользователя postgres.
+#
+# pg_dump запускается удалённо от имени postgres.
+# Формат custom задаётся параметром --format=custom.
 remote_dump_command="cd /tmp && sudo -n -u postgres pg_dump --format=custom --dbname=$(printf '%q' "$DB_NAME")"
+
+# Команда сохранения глобальных объектов PostgreSQL.
 remote_globals_command="cd /tmp && sudo -n -u postgres pg_dumpall --globals-only"
 
+# Подключиться к текущему primary и передать поток дампа базы
+# непосредственно в временный файл на edge.
+#
+# BatchMode запрещает интерактивный запрос пароля.
+# IdentitiesOnly разрешает использовать только указанный ключ.
+# StrictHostKeyChecking разрешает подключение только к известному серверу.
 ssh \
     -i "$SSH_KEY" \
     -o BatchMode=yes \
@@ -74,8 +158,9 @@ ssh \
     -o UserKnownHostsFile="$KNOWN_HOSTS" \
     -o StrictHostKeyChecking=yes \
     -o ConnectTimeout=10 \
-    "{{ backup_ssh_user }}@$DB_HOST" "$remote_dump_command" > "$TEMP_DIR/database.dump"
+    "$SSH_USER@$DB_HOST" "$remote_dump_command" > "$TEMP_DIR/database.dump"
 
+# Аналогично сохранить роли и остальные глобальные объекты PostgreSQL.
 ssh \
     -i "$SSH_KEY" \
     -o BatchMode=yes \
@@ -83,21 +168,48 @@ ssh \
     -o UserKnownHostsFile="$KNOWN_HOSTS" \
     -o StrictHostKeyChecking=yes \
     -o ConnectTimeout=10 \
-    "{{ backup_ssh_user }}@$DB_HOST" "$remote_globals_command" > "$TEMP_DIR/globals.sql"
+    "$SSH_USER@$DB_HOST" "$remote_globals_command" > "$TEMP_DIR/globals.sql"
 
-[[ -s "$TEMP_DIR/database.dump" ]] || fail "дамп базы пустой"
-[[ -s "$TEMP_DIR/globals.sql" ]] || fail "дамп глобальных ролей пустой"
-file "$TEMP_DIR/database.dump" | grep -q "PostgreSQL custom database dump"
+# Проверить, что оба созданных файла не пустые.
+[[ -s "$TEMP_DIR/database.dump" ]] ||
+    fail "дамп базы пустой"
 
+[[ -s "$TEMP_DIR/globals.sql" ]] ||
+    fail "дамп глобальных ролей пустой"
+
+# Проверить сигнатуру дампа.
+#
+# Команда file должна определить его как PostgreSQL custom database dump.
+file "$TEMP_DIR/database.dump" |
+    grep -q "PostgreSQL custom database dump"
+
+# Дополнительно проверить структуру дампа штатной утилитой PostgreSQL.
+#
+# pg_restore --list читает содержание архива, но ничего не восстанавливает.
+pg_restore --list "$TEMP_DIR/database.dump" >/dev/null
+
+# После успешной проверки переместить временные файлы
+# под окончательными именами.
 mv -- "$TEMP_DIR/database.dump" "$dump_archive"
 mv -- "$TEMP_DIR/globals.sql" "$globals_archive"
+
+# Временный каталог теперь пуст и больше не нужен.
 rmdir -- "$TEMP_DIR"
 TEMP_DIR=""
 
-find "$BACKUP_DIR" -type f \( \
-    -name 'mediawiki-db-*.dump' -o \
-    -name 'mediawiki-globals-*.sql' \
-    \) -mtime "+$RETENTION_DAYS" -delete
+# Удалить только резервные копии MediaWiki,
+# которые старше установленного срока хранения.
+#
+# Скобки объединяют два допустимых шаблона имён:
+# дампы базы и файлы глобальных объектов.
+find "$BACKUP_DIR" \
+    -type f \
+    \( \
+        -name 'mediawiki-db-*.dump' -o \
+        -name 'mediawiki-globals-*.sql' \
+    \) \
+    -mtime "+$RETENTION_DAYS" \
+    -delete
 
 log "Готово: $dump_archive"
 log "Готово: $globals_archive"
