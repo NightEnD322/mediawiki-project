@@ -1,0 +1,25 @@
+server {
+    listen 80 default_server;
+    server_name _;
+
+    root /var/www/mediawiki;
+    index index.php;
+    client_max_body_size 50M;
+
+    location / {
+        try_files $uri $uri/ /index.php?$args;
+    }
+
+    location ~* ^/images/.*\.php$ {
+        deny all;
+    }
+
+    location ~ \.php$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/run/php/php8.1-fpm.sock;
+    }
+
+    location ~ /\. {
+        deny all;
+    }
+}

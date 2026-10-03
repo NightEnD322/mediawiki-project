@@ -1,0 +1,201 @@
+---
+- name: Validate PostgreSQL promotion parameters
+  hosts: localhost
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Validate the requested topology
+      ansible.builtin.assert:
+        that:
+          - new_primary_host is defined
+          - old_primary_host is defined
+          - new_primary_host in postgresql_node_ips
+          - old_primary_host in postgresql_node_ips
+          - new_primary_host != old_primary_host
+          - >
+            (new_primary_host == postgresql_standby_host and
+             old_primary_host == postgresql_primary_host) or
+            (new_primary_host == postgresql_primary_host and
+             old_primary_host == postgresql_standby_host)
+        fail_msg: >-
+          Укажи текущую реплику как new_primary_host, а текущий primary
+          как old_primary_host. Допустимые узлы: db1 и db2.
+        success_msg: "Параметры переключения проверены"
+
+- name: Verify that the old primary is fenced
+  hosts: edge
+  gather_facts: false
+  vars:
+    old_primary_ip: "{{ postgresql_node_ips[old_primary_host] }}"
+  tasks:
+    - name: Confirm that PostgreSQL on the old primary is unavailable
+      ansible.builtin.wait_for:
+        host: "{{ old_primary_ip }}"
+        port: 5432
+        state: stopped
+        timeout: 5
+        connect_timeout: 2
+        msg: >-
+          Старый primary всё ещё принимает подключения на порту 5432.
+          Сначала останови его ВМ или PostgreSQL, чтобы избежать split-brain.
+
+- name: Promote the PostgreSQL standby
+  hosts: "{{ new_primary_host }}"
+  become: true
+  vars:
+    old_primary_ip: "{{ postgresql_node_ips[old_primary_host] }}"
+  tasks:
+    - name: Check the current PostgreSQL recovery state
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - -d
+          - postgres
+          - -tAc
+          - "SELECT pg_is_in_recovery()"
+      register: promotion_recovery_state
+      changed_when: false
+
+    - name: Promote the standby to primary
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - -d
+          - postgres
+          - -tAc
+          - "SELECT pg_promote(true, 60)"
+      when: promotion_recovery_state.stdout | trim == "t"
+
+    - name: Wait until the promoted server leaves recovery
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - -d
+          - postgres
+          - -tAc
+          - "SELECT pg_is_in_recovery()"
+      register: promoted_recovery_state
+      changed_when: false
+      retries: 15
+      delay: 2
+      until: promoted_recovery_state.stdout | trim == "f"
+
+    - name: Allow MediaWiki connections on the new primary
+      ansible.builtin.lineinfile:
+        path: "/etc/postgresql/{{ postgresql_version }}/{{ postgresql_cluster }}/pg_hba.conf"
+        line: >-
+          host {{ mediawiki_database_name }} {{ mediawiki_database_user }}
+          {{ item }} scram-sha-256
+        state: present
+      loop: "{{ postgresql_app_cidrs }}"
+      notify: Reload PostgreSQL
+
+    - name: Allow the old primary to rejoin as a standby
+      ansible.builtin.lineinfile:
+        path: "/etc/postgresql/{{ postgresql_version }}/{{ postgresql_cluster }}/pg_hba.conf"
+        line: >-
+          host replication {{ postgresql_replication_user }}
+          {{ old_primary_ip }}/32 scram-sha-256
+        state: present
+      notify: Reload PostgreSQL
+
+    - name: Apply PostgreSQL access rules immediately
+      ansible.builtin.meta: flush_handlers
+
+  handlers:
+    - name: Reload PostgreSQL
+      ansible.builtin.service:
+        name: postgresql
+        state: reloaded
+
+- name: Record the new PostgreSQL topology
+  hosts: localhost
+  gather_facts: false
+  become: false
+  vars:
+    new_primary_ip: "{{ postgresql_node_ips[new_primary_host] }}"
+    new_standby_ip: "{{ postgresql_node_ips[old_primary_host] }}"
+  tasks:
+    - name: Record the primary host
+      ansible.builtin.lineinfile:
+        path: "{{ playbook_dir }}/group_vars/all/vars.yml"
+        regexp: '^postgresql_primary_host:'
+        line: "postgresql_primary_host: {{ new_primary_host }}"
+
+    - name: Record the primary IP address
+      ansible.builtin.lineinfile:
+        path: "{{ playbook_dir }}/group_vars/all/vars.yml"
+        regexp: '^postgresql_primary_ip:'
+        line: 'postgresql_primary_ip: "{{ new_primary_ip }}"'
+
+    - name: Record the standby host
+      ansible.builtin.lineinfile:
+        path: "{{ playbook_dir }}/group_vars/all/vars.yml"
+        regexp: '^postgresql_standby_host:'
+        line: "postgresql_standby_host: {{ old_primary_host }}"
+
+- name: Switch MediaWiki to the new primary
+  hosts: app
+  become: true
+  vars:
+    new_primary_ip: "{{ postgresql_node_ips[new_primary_host] }}"
+  tasks:
+    - name: Update the MediaWiki database server
+      ansible.builtin.lineinfile:
+        path: /var/www/mediawiki/LocalSettings.php
+        regexp: '^\$wgDBserver\s*='
+        line: "$wgDBserver = '{{ new_primary_ip }}';"
+      register: mediawiki_database_server
+
+    - name: Restart PHP-FPM after changing the database server
+      ansible.builtin.service:
+        name: php8.1-fpm
+        state: restarted
+      when: mediawiki_database_server.changed
+
+    - name: Verify MediaWiki on each application node
+      ansible.builtin.uri:
+        url: http://127.0.0.1/index.php
+        status_code: 200
+        return_content: false
+        timeout: 15
+      register: mediawiki_application_health
+      retries: 5
+      delay: 3
+      until: mediawiki_application_health.status == 200
+
+- name: Switch database backups to the new primary
+  hosts: edge
+  become: true
+  vars:
+    new_primary_ip: "{{ postgresql_node_ips[new_primary_host] }}"
+  tasks:
+    - name: Update the default backup database host
+      ansible.builtin.lineinfile:
+        path: /usr/local/sbin/mediawiki-database-backup
+        regexp: '^DB_HOST='
+        line: 'DB_HOST="${1:-{{ new_primary_ip }}}"'
+
+    - name: Verify MediaWiki through the load balancer
+      ansible.builtin.uri:
+        url: http://127.0.0.1/index.php
+        status_code: 200
+        return_content: false
+
+    - name: Record the standby IP address
+      ansible.builtin.lineinfile:
+        path: "{{ playbook_dir }}/group_vars/all/vars.yml"
+        regexp: '^postgresql_standby_ip:'
+        line: 'postgresql_standby_ip: "{{ new_standby_ip }}"'

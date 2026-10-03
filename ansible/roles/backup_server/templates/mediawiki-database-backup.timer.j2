@@ -1,0 +1,12 @@
+# Managed by Ansible.
+
+[Unit]
+Description=MediaWiki database backup every six hours
+
+[Timer]
+OnCalendar={{ backup_database_schedule }}
+Persistent=true
+Unit=mediawiki-backup@database.service
+
+[Install]
+WantedBy=timers.target

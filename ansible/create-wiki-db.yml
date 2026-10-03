@@ -1,0 +1,112 @@
+---
+- name: Create PostgreSQL roles and MediaWiki database
+  hosts: database
+  become: true
+  tasks:
+    - name: Skip database nodes that are not the configured primary
+      ansible.builtin.meta: end_host
+      when: inventory_hostname != postgresql_primary_host
+    - name: Check whether the replication role exists
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - -tAc
+          - "SELECT 1 FROM pg_roles WHERE rolname = '{{ postgresql_replication_user }}'"
+      register: replication_role_check
+      changed_when: false
+
+    - name: Create the replication role
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - -c
+          - "CREATE ROLE {{ postgresql_replication_user }} WITH REPLICATION LOGIN ENCRYPTED PASSWORD '{{ vault_replication_password }}';"
+      when: replication_role_check.stdout | trim != "1"
+      no_log: true
+    - name: Enforce the replication role password
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - -v
+          - ON_ERROR_STOP=1
+          - -c
+          - "ALTER ROLE {{ postgresql_replication_user }} WITH REPLICATION LOGIN PASSWORD '{{ vault_replication_password }}';"
+      changed_when: false
+      no_log: true
+
+    - name: Check whether the MediaWiki role exists
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - -tAc
+          - "SELECT 1 FROM pg_roles WHERE rolname = '{{ mediawiki_database_user }}'"
+      register: wiki_role_check
+      changed_when: false
+
+    - name: Create the MediaWiki role
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - -c
+          - "CREATE ROLE {{ mediawiki_database_user }} LOGIN ENCRYPTED PASSWORD '{{ vault_mediawiki_db_password }}';"
+      when: wiki_role_check.stdout | trim != "1"
+      no_log: true
+    - name: Enforce the MediaWiki role password
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - -v
+          - ON_ERROR_STOP=1
+          - -c
+          - "ALTER ROLE {{ mediawiki_database_user }} WITH LOGIN PASSWORD '{{ vault_mediawiki_db_password }}';"
+      changed_when: false
+      no_log: true
+
+    - name: Check whether the MediaWiki database exists
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - -tAc
+          - "SELECT 1 FROM pg_database WHERE datname = '{{ mediawiki_database_name }}'"
+      register: wiki_db_check
+      changed_when: false
+
+    - name: Create the MediaWiki database
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - createdb
+          - "--owner={{ mediawiki_database_user }}"
+          - "{{ mediawiki_database_name }}"
+      when: wiki_db_check.stdout | trim != "1"

@@ -1,0 +1,14 @@
+---
+- name: Refresh apt package index
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Install common diagnostic tools
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - curl
+      - wget
+      - python3-apt
+    state: present

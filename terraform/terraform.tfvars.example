@@ -1,0 +1,3 @@
+folder_id       = "your-folder-id"
+ssh_public_key  = "ssh-ed25519 AAAA... user@management-host"
+management_cidr = "10.10.0.0/16"

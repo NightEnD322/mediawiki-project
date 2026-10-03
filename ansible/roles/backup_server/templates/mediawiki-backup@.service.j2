@@ -1,0 +1,15 @@
+# Managed by Ansible.
+
+[Unit]
+Description=MediaWiki %i backup
+Wants=network-online.target
+After=network-online.target
+RequiresMountsFor={{ backup_root_directory }}
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/mediawiki-%i-backup
+Restart=on-failure
+RestartSec=60s

@@ -1,0 +1,253 @@
+---
+- name: Install PostgreSQL for the Zabbix database
+  ansible.builtin.apt:
+    name: postgresql
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Install the Zabbix server and web interface
+  ansible.builtin.apt:
+    name:
+      - apache2
+      - libapache2-mod-php
+      - php-pgsql
+      - zabbix-server-pgsql
+      - zabbix-frontend-php
+      - zabbix-sql-scripts
+      - zabbix-apache-conf
+    state: present
+    policy_rc_d: 101
+
+- name: Enable and start PostgreSQL
+  ansible.builtin.service:
+    name: postgresql
+    state: started
+    enabled: true
+
+- name: Check whether the Zabbix database role exists
+  ansible.builtin.command:
+    argv:
+      - runuser
+      - -u
+      - postgres
+      - --
+      - psql
+      - -d
+      - postgres
+      - -tAc
+      - "SELECT 1 FROM pg_roles WHERE rolname = '{{ zabbix_database_user }}'"
+  register: zabbix_database_role_check
+  changed_when: false
+
+- name: Create the Zabbix database role
+  ansible.builtin.command:
+    argv:
+      - runuser
+      - -u
+      - postgres
+      - --
+      - psql
+      - -v
+      - ON_ERROR_STOP=1
+      - -d
+      - postgres
+      - -c
+      - "CREATE ROLE {{ zabbix_database_user }} WITH LOGIN PASSWORD '{{ vault_zabbix_db_password }}';"
+  when: zabbix_database_role_check.stdout | trim != "1"
+  no_log: true
+
+- name: Enforce the Zabbix database password
+  ansible.builtin.command:
+    argv:
+      - runuser
+      - -u
+      - postgres
+      - --
+      - psql
+      - -v
+      - ON_ERROR_STOP=1
+      - -d
+      - postgres
+      - -c
+      - "ALTER ROLE {{ zabbix_database_user }} WITH LOGIN PASSWORD '{{ vault_zabbix_db_password }}';"
+  changed_when: false
+  no_log: true
+
+- name: Check whether the Zabbix database exists
+  ansible.builtin.command:
+    argv:
+      - runuser
+      - -u
+      - postgres
+      - --
+      - psql
+      - -d
+      - postgres
+      - -tAc
+      - "SELECT 1 FROM pg_database WHERE datname = '{{ zabbix_database_name }}'"
+  register: zabbix_database_check
+  changed_when: false
+
+- name: Create the Zabbix database
+  ansible.builtin.command:
+    argv:
+      - runuser
+      - -u
+      - postgres
+      - --
+      - createdb
+      - "--owner={{ zabbix_database_user }}"
+      - "{{ zabbix_database_name }}"
+  when: zabbix_database_check.stdout | trim != "1"
+
+- name: Check whether the Zabbix database schema exists
+  ansible.builtin.command:
+    argv:
+      - runuser
+      - -u
+      - postgres
+      - --
+      - psql
+      - -d
+      - "{{ zabbix_database_name }}"
+      - -tAc
+      - "SELECT to_regclass('public.dbversion')"
+  register: zabbix_schema_check
+  changed_when: false
+
+- name: Import the initial Zabbix database schema
+  ansible.builtin.shell: |
+    set -o pipefail
+    zcat /usr/share/zabbix-sql-scripts/postgresql/server.sql.gz |
+      runuser -u zabbix -- psql \
+        --set=ON_ERROR_STOP=1 \
+        --dbname="{{ zabbix_database_name }}"
+  args:
+    executable: /bin/bash
+    chdir: /tmp
+  when: zabbix_schema_check.stdout | trim != "dbversion"
+
+- name: Configure the Zabbix server database parameters
+  ansible.builtin.lineinfile:
+    path: /etc/zabbix/zabbix_server.conf
+    regexp: "^#?\\s*{{ item.key }}="
+    line: "{{ item.key }}={{ item.value }}"
+  loop:
+    - key: DBHost
+      value: "{{ zabbix_database_host }}"
+    - key: DBName
+      value: "{{ zabbix_database_name }}"
+    - key: DBUser
+      value: "{{ zabbix_database_user }}"
+    - key: Timeout
+      value: "{{ zabbix_server_timeout }}"
+    - key: StartHTTPPollers
+      value: "{{ zabbix_http_pollers }}"
+  notify: Restart Zabbix server
+
+- name: Configure the Zabbix server database password
+  ansible.builtin.lineinfile:
+    path: /etc/zabbix/zabbix_server.conf
+    regexp: "^#?\\s*DBPassword="
+    line: "DBPassword={{ vault_zabbix_db_password }}"
+  no_log: true
+  notify: Restart Zabbix server
+
+- name: Create the Zabbix frontend configuration directory
+  ansible.builtin.file:
+    path: /etc/zabbix/web
+    state: directory
+    owner: root
+    group: www-data
+    mode: "0750"
+
+- name: Configure the Zabbix frontend
+  ansible.builtin.template:
+    src: zabbix.conf.php.j2
+    dest: /etc/zabbix/web/zabbix.conf.php
+    owner: root
+    group: www-data
+    mode: "0640"
+  no_log: true
+
+- name: Configure Apache listening ports
+  ansible.builtin.template:
+    src: ports.conf.j2
+    dest: /etc/apache2/ports.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload Apache
+
+- name: Configure the Apache default virtual host
+  ansible.builtin.template:
+    src: 000-default.conf.j2
+    dest: /etc/apache2/sites-available/000-default.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload Apache
+
+- name: Enable the Zabbix Apache configuration
+  ansible.builtin.command:
+    argv:
+      - a2enconf
+      - zabbix
+  register: zabbix_apache_conf
+  changed_when: "'Enabling conf zabbix' in zabbix_apache_conf.stdout"
+  notify: Reload Apache
+
+- name: Enable the Apache PHP module
+  ansible.builtin.command:
+    argv:
+      - a2enmod
+      - php8.1
+  register: zabbix_apache_php
+  changed_when: "'Enabling module php8.1' in zabbix_apache_php.stdout"
+  notify: Reload Apache
+
+- name: Enable the Apache default site
+  ansible.builtin.command:
+    argv:
+      - a2ensite
+      - 000-default
+  register: zabbix_apache_site
+  changed_when: "'Enabling site 000-default' in zabbix_apache_site.stdout"
+  notify: Reload Apache
+
+- name: Test the Apache configuration
+  ansible.builtin.command:
+    argv:
+      - apache2ctl
+      - configtest
+  changed_when: false
+
+- name: Verify the Zabbix database credentials
+  ansible.builtin.command:
+    argv:
+      - psql
+      - "--host={{ zabbix_database_host }}"
+      - "--port={{ zabbix_database_port }}"
+      - "--username={{ zabbix_database_user }}"
+      - "--dbname={{ zabbix_database_name }}"
+      - -tAc
+      - "SELECT 1"
+  environment:
+    PGPASSWORD: "{{ vault_zabbix_db_password }}"
+  register: zabbix_database_connection
+  changed_when: false
+  failed_when: zabbix_database_connection.stdout | trim != "1"
+  no_log: true
+
+- name: Enable and start Apache
+  ansible.builtin.service:
+    name: apache2
+    state: started
+    enabled: true
+
+- name: Enable and start the Zabbix server
+  ansible.builtin.service:
+    name: zabbix-server
+    state: started
+    enabled: true

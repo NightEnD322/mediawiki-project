@@ -1,0 +1,196 @@
+---
+- name: Install backup utilities
+  ansible.builtin.apt:
+    name:
+      - openssh-client
+      - tar
+      - gzip
+      - file
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Create the backup SSH directory
+  ansible.builtin.file:
+    path: "/home/{{ backup_ssh_user }}/.ssh"
+    state: directory
+    owner: "{{ backup_ssh_user }}"
+    group: "{{ backup_ssh_user }}"
+    mode: "0700"
+
+- name: Generate the backup SSH key
+  ansible.builtin.command:
+    argv:
+      - runuser
+      - -u
+      - "{{ backup_ssh_user }}"
+      - --
+      - ssh-keygen
+      - -t
+      - ed25519
+      - -f
+      - "{{ backup_ssh_key }}"
+      - -N
+      - ""
+      - -C
+      - mediawiki-backup@edge-ops
+    creates: "{{ backup_ssh_key }}"
+
+- name: Protect the backup private key
+  ansible.builtin.file:
+    path: "{{ backup_ssh_key }}"
+    owner: "{{ backup_ssh_user }}"
+    group: "{{ backup_ssh_user }}"
+    mode: "0600"
+
+- name: Set permissions on the backup public key
+  ansible.builtin.file:
+    path: "{{ backup_ssh_key }}.pub"
+    owner: "{{ backup_ssh_user }}"
+    group: "{{ backup_ssh_user }}"
+    mode: "0644"
+
+- name: Read the backup public key
+  ansible.builtin.slurp:
+    src: "{{ backup_ssh_key }}.pub"
+  register: backup_public_key_file
+
+- name: Authorize the backup key on application and database nodes
+  ansible.posix.authorized_key:
+    user: "{{ backup_ssh_user }}"
+    key: "{{ backup_public_key_file.content | b64decode | trim }}"
+    state: present
+    manage_dir: true
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['app'] + groups['database'] }}"
+
+- name: Allow the filesystem backup command on application nodes
+  ansible.builtin.copy:
+    dest: /etc/sudoers.d/mediawiki-files-backup
+    content: |
+      # Managed by Ansible
+      {{ backup_ssh_user }} ALL=(root) NOPASSWD: /usr/bin/tar
+    owner: root
+    group: root
+    mode: "0440"
+    validate: /usr/sbin/visudo -cf %s
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['app'] }}"
+
+- name: Allow the database backup commands on database nodes
+  ansible.builtin.copy:
+    dest: /etc/sudoers.d/mediawiki-database-backup
+    content: |
+      # Managed by Ansible
+      {{ backup_ssh_user }} ALL=(postgres) NOPASSWD: /usr/bin/pg_dump, /usr/bin/pg_dumpall
+    owner: root
+    group: root
+    mode: "0440"
+    validate: /usr/sbin/visudo -cf %s
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['database'] }}"
+
+- name: Scan the SSH host keys of backup targets
+  ansible.builtin.command:
+    argv:
+      - ssh-keyscan
+      - -T
+      - "5"
+      - -t
+      - ed25519
+      - "{{ item }}"
+  loop: "{{ (mediawiki_app_upstreams + [postgresql_primary_ip, postgresql_standby_ip]) | unique | sort | list }}"
+  register: backup_host_key_scan
+  changed_when: false
+  failed_when:
+    - backup_host_key_scan.rc != 0 or backup_host_key_scan.stdout | trim == ""
+
+- name: Install the managed backup known_hosts file
+  ansible.builtin.copy:
+    dest: "{{ backup_known_hosts }}"
+    content: "{{ backup_host_key_scan.results | map(attribute='stdout') | join('\n') }}\n"
+    owner: "{{ backup_ssh_user }}"
+    group: "{{ backup_ssh_user }}"
+    mode: "0644"
+
+- name: Create the filesystem backup directory
+  ansible.builtin.file:
+    path: "{{ backup_files_directory }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Create the database backup directory
+  ansible.builtin.file:
+    path: "{{ backup_database_directory }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Install the filesystem backup script
+  ansible.builtin.template:
+    src: mediawiki-files-backup.j2
+    dest: /usr/local/sbin/mediawiki-files-backup
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Install the database backup script
+  ansible.builtin.template:
+    src: mediawiki-database-backup.j2
+    dest: /usr/local/sbin/mediawiki-database-backup
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Install the MediaWiki backup service
+  ansible.builtin.template:
+    src: mediawiki-backup@.service.j2
+    dest: /etc/systemd/system/mediawiki-backup@.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload systemd
+
+- name: Install the filesystem backup timer
+  ansible.builtin.template:
+    src: mediawiki-files-backup.timer.j2
+    dest: /etc/systemd/system/mediawiki-files-backup.timer
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload systemd
+
+- name: Install the database backup timer
+  ansible.builtin.template:
+    src: mediawiki-database-backup.timer.j2
+    dest: /etc/systemd/system/mediawiki-database-backup.timer
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload systemd
+
+- name: Apply the new systemd unit definitions
+  ansible.builtin.meta: flush_handlers
+
+- name: Verify the backup systemd units
+  ansible.builtin.command:
+    argv:
+      - systemd-analyze
+      - verify
+      - mediawiki-backup@files.service
+      - mediawiki-backup@database.service
+      - mediawiki-files-backup.timer
+      - mediawiki-database-backup.timer
+  changed_when: false
+
+- name: Enable and start the backup timers
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: started
+    enabled: true
+  loop:
+    - mediawiki-files-backup.timer
+    - mediawiki-database-backup.timer

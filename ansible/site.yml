@@ -1,0 +1,53 @@
+---
+- name: Configure common baseline
+  hosts: all
+  become: true
+  roles:
+    - common
+- name: Configure Zabbix agents
+  hosts: all
+  become: true
+  roles:
+    - role: zabbix_agent
+      tags: zabbix_agent
+- name: Configure shared NFS storage
+  hosts: edge
+  become: true
+  roles:
+    - role: nfs_server
+      tags: nfs_server
+- name: Install MediaWiki web runtime
+  hosts: app
+  become: true
+  roles:
+    - role: mediawiki_app
+      tags: mediawiki_app
+- name: Mount shared MediaWiki uploads
+  hosts: app
+  become: true
+  roles:
+    - role: nfs_client
+      tags: nfs_client
+- name: Install PostgreSQL on database nodes
+  hosts: database
+  become: true
+  roles:
+    - postgresql
+- name: Configure MediaWiki backups
+  hosts: edge
+  become: true
+  roles:
+    - role: backup_server
+      tags: backup_server
+- name: Configure the Zabbix server and frontend
+  hosts: edge
+  become: true
+  roles:
+    - role: zabbix_server
+      tags: zabbix_server
+- name: Configure the public load balancer
+  hosts: edge
+  become: true
+  roles:
+    - role: edge
+      tags: edge

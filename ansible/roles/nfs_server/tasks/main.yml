@@ -1,0 +1,62 @@
+---
+- name: Install NFS server
+  ansible.builtin.apt:
+    name: nfs-kernel-server
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Create the data disk mount point
+  ansible.builtin.file:
+    path: "{{ nfs_data_mount }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Create an ext4 filesystem on the data disk
+  community.general.filesystem:
+    fstype: ext4
+    dev: "{{ nfs_data_device }}"
+    force: false
+
+- name: Mount the MediaWiki data disk
+  ansible.posix.mount:
+    path: "{{ nfs_data_mount }}"
+    src: "{{ nfs_data_device }}"
+    fstype: ext4
+    opts: defaults,nofail
+    dump: "0"
+    passno: "2"
+    state: mounted
+
+- name: Create the shared MediaWiki images directory
+  ansible.builtin.file:
+    path: "{{ nfs_images_path }}"
+    state: directory
+    owner: www-data
+    group: www-data
+    mode: "2775"
+
+- name: Create the backup root directory
+  ansible.builtin.file:
+    path: "{{ nfs_data_mount }}/backups"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Configure the MediaWiki NFS export
+  ansible.builtin.template:
+    src: exports.j2
+    dest: /etc/exports
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload NFS exports
+
+- name: Enable and start the NFS server
+  ansible.builtin.service:
+    name: nfs-kernel-server
+    state: started
+    enabled: true

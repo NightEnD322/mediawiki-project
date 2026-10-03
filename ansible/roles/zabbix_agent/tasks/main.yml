@@ -1,0 +1,63 @@
+---
+- name: Gather installed package facts
+  ansible.builtin.package_facts:
+    manager: auto
+
+- name: Download the Zabbix repository package
+  ansible.builtin.get_url:
+    url: "{{ zabbix_release_package_url }}"
+    dest: /tmp/zabbix-release.deb
+    mode: "0644"
+    timeout: 60
+  register: zabbix_repository_download
+  retries: 3
+  delay: 5
+  until: zabbix_repository_download is succeeded
+  when: "'zabbix-release' not in ansible_facts.packages"
+
+- name: Install the Zabbix repository package
+  ansible.builtin.apt:
+    deb: /tmp/zabbix-release.deb
+    state: present
+  register: zabbix_repository_package
+  when: "'zabbix-release' not in ansible_facts.packages"
+
+- name: Configure the Zabbix APT repository
+  ansible.builtin.template:
+    src: zabbix.list.j2
+    dest: /etc/apt/sources.list.d/zabbix.list
+    owner: root
+    group: root
+    mode: "0644"
+  register: zabbix_repository_configuration
+
+- name: Refresh APT after configuring the Zabbix repository
+  ansible.builtin.apt:
+    update_cache: true
+  when:
+    - zabbix_repository_package.changed or zabbix_repository_configuration.changed
+
+- name: Install Zabbix Agent
+  ansible.builtin.apt:
+    name: zabbix-agent
+    state: present
+
+- name: Allow passive checks from the Zabbix server
+  ansible.builtin.lineinfile:
+    path: /etc/zabbix/zabbix_agentd.conf
+    regexp: '^\s*#?\s*Server='
+    line: "Server={{ zabbix_server_ip }},127.0.0.1"
+  notify: Restart Zabbix Agent
+
+- name: Set the Zabbix Agent host name
+  ansible.builtin.lineinfile:
+    path: /etc/zabbix/zabbix_agentd.conf
+    regexp: '^\s*#?\s*Hostname='
+    line: "Hostname={{ inventory_hostname }}"
+  notify: Restart Zabbix Agent
+
+- name: Enable and start Zabbix Agent
+  ansible.builtin.service:
+    name: zabbix-agent
+    state: started
+    enabled: true

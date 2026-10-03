@@ -1,0 +1,161 @@
+---
+- name: Install Nginx, PHP-FPM and MediaWiki PHP extensions
+  ansible.builtin.apt:
+    name:
+      - nginx
+      - php-fpm
+      - php-intl
+      - php-mbstring
+      - php-xml
+      - php-apcu
+      - php-curl
+      - php-pgsql
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Enable and start Nginx
+  ansible.builtin.service:
+    name: nginx
+    state: started
+    enabled: true
+
+- name: Enable and start PHP-FPM for Ubuntu 22.04
+  ansible.builtin.service:
+    name: php8.1-fpm
+    state: started
+    enabled: true
+
+- name: Check whether MediaWiki is already installed
+  ansible.builtin.stat:
+    path: /var/www/mediawiki/index.php
+  register: mediawiki_installation
+
+- name: Download MediaWiki release archive
+  ansible.builtin.get_url:
+    url: "https://releases.wikimedia.org/mediawiki/1.42/mediawiki-{{ mediawiki_version }}.tar.gz"
+    dest: "/tmp/mediawiki-{{ mediawiki_version }}.tar.gz"
+    owner: root
+    group: root
+    mode: "0644"
+    checksum: "sha256:{{ mediawiki_archive_sha256 }}"
+    timeout: 60
+  register: mediawiki_download
+  retries: 3
+  delay: 5
+  until: mediawiki_download is succeeded
+  when: not mediawiki_installation.stat.exists
+
+- name: Create the MediaWiki web root
+  ansible.builtin.file:
+    path: /var/www/mediawiki
+    state: directory
+    owner: root
+    group: www-data
+    mode: "0755"
+
+- name: Extract MediaWiki
+  ansible.builtin.unarchive:
+    src: "/tmp/mediawiki-{{ mediawiki_version }}.tar.gz"
+    dest: /var/www/mediawiki
+    remote_src: true
+    extra_opts:
+      - --strip-components=1
+    creates: /var/www/mediawiki/index.php
+  when: not mediawiki_installation.stat.exists
+
+- name: Deploy MediaWiki Nginx site
+  ansible.builtin.template:
+    src: mediawiki.conf.j2
+    dest: /etc/nginx/sites-available/mediawiki
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload Nginx
+
+- name: Enable MediaWiki Nginx site
+  ansible.builtin.file:
+    src: /etc/nginx/sites-available/mediawiki
+    dest: /etc/nginx/sites-enabled/mediawiki
+    state: link
+  notify: Reload Nginx
+
+- name: Disable the default Nginx site
+  ansible.builtin.file:
+    path: /etc/nginx/sites-enabled/default
+    state: absent
+  notify: Reload Nginx
+
+- name: Test Nginx configuration
+  ansible.builtin.command:
+    argv:
+      - nginx
+      - -t
+  changed_when: false
+
+- name: Check whether LocalSettings.php exists
+  ansible.builtin.stat:
+    path: /var/www/mediawiki/LocalSettings.php
+  register: mediawiki_localsettings
+
+- name: Manage the installed MediaWiki configuration
+  when: mediawiki_localsettings.stat.exists
+  block:
+    - name: Configure the public MediaWiki URL
+      ansible.builtin.lineinfile:
+        path: /var/www/mediawiki/LocalSettings.php
+        regexp: '^\$wgServer\s*='
+        line: "$wgServer = '{{ mediawiki_public_url }}';"
+
+    - name: Configure the PostgreSQL primary address
+      ansible.builtin.lineinfile:
+        path: /var/www/mediawiki/LocalSettings.php
+        regexp: '^\$wgDBserver\s*='
+        line: "$wgDBserver = '{{ postgresql_primary_ip }}';"
+
+    - name: Configure the MediaWiki database name
+      ansible.builtin.lineinfile:
+        path: /var/www/mediawiki/LocalSettings.php
+        regexp: '^\$wgDBname\s*='
+        line: "$wgDBname = '{{ mediawiki_database_name }}';"
+
+    - name: Configure the MediaWiki database user
+      ansible.builtin.lineinfile:
+        path: /var/www/mediawiki/LocalSettings.php
+        regexp: '^\$wgDBuser\s*='
+        line: "$wgDBuser = '{{ mediawiki_database_user }}';"
+
+    - name: Configure the MediaWiki database password
+      ansible.builtin.lineinfile:
+        path: /var/www/mediawiki/LocalSettings.php
+        regexp: '^\$wgDBpassword\s*='
+        line: "$wgDBpassword = '{{ vault_mediawiki_db_password }}';"
+      no_log: true
+
+    - name: Configure the MediaWiki secret key
+      ansible.builtin.lineinfile:
+        path: /var/www/mediawiki/LocalSettings.php
+        regexp: '^\$wgSecretKey\s*='
+        line: "$wgSecretKey = '{{ vault_mediawiki_secret_key }}';"
+      no_log: true
+
+    - name: Configure the MediaWiki upgrade key
+      ansible.builtin.lineinfile:
+        path: /var/www/mediawiki/LocalSettings.php
+        regexp: '^\$wgUpgradeKey\s*='
+        line: "$wgUpgradeKey = '{{ vault_mediawiki_upgrade_key }}';"
+      no_log: true
+
+    - name: Protect LocalSettings.php
+      ansible.builtin.file:
+        path: /var/www/mediawiki/LocalSettings.php
+        owner: www-data
+        group: www-data
+        mode: "0600"
+
+- name: Report that the MediaWiki web installer is required
+  ansible.builtin.debug:
+    msg: >-
+      LocalSettings.php is absent. Complete the MediaWiki web installer,
+      place the generated file on app1, and run this playbook again.
+  when: not mediawiki_localsettings.stat.exists

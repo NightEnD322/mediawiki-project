@@ -1,0 +1,6 @@
+---
+vault_replication_password: "CHANGE_ME"
+vault_mediawiki_db_password: "CHANGE_ME"
+vault_zabbix_db_password: "CHANGE_ME"
+vault_mediawiki_secret_key: "CHANGE_ME"
+vault_mediawiki_upgrade_key: "CHANGE_ME"

@@ -1,0 +1,76 @@
+---
+postgresql_version: "14"
+postgresql_cluster: main
+postgresql_node_ips:
+  db1: "10.20.1.29"
+  db2: "10.20.2.10"
+
+postgresql_primary_host: db1
+postgresql_primary_ip: "10.20.1.29"
+
+postgresql_standby_host: db2
+postgresql_standby_ip: "10.20.2.10"
+
+postgresql_replication_user: replicator
+
+mediawiki_version: "1.42.1"
+mediawiki_archive_sha256: "ec87af95a35dd09c34d52e02795652a030ab72955e431f08ca722a73737eba53"
+mediawiki_database_name: my_wiki
+mediawiki_database_user: wikiuser
+
+postgresql_app_cidrs:
+  - "10.20.1.0/24"
+  - "10.20.2.0/24"
+
+nfs_server_ip: "10.20.1.17"
+nfs_data_device: /dev/disk/by-id/virtio-wiki-shared-data
+nfs_data_mount: /srv/mediawiki-data
+nfs_images_path: /srv/mediawiki-data/images
+nfs_client_mount: /var/www/mediawiki/images
+nfs_mount_options: rw,hard,_netdev,nofail,timeo=600,retrans=2
+
+nfs_allowed_cidrs:
+  - "10.20.1.0/24"
+  - "10.20.2.0/24"
+
+mediawiki_app_upstreams:
+  - "10.20.1.5"
+  - "10.20.2.34"
+
+zabbix_web_backend: "127.0.0.1:8080"
+
+zabbix_server_ip: "10.20.1.17"
+zabbix_release_package_url: "https://repo.zabbix.com/zabbix/7.0/ubuntu/pool/main/z/zabbix-release/zabbix-release_latest+ubuntu22.04_all.deb"
+zabbix_major_version: "7.0"
+
+zabbix_database_host: localhost
+zabbix_database_port: "5432"
+zabbix_database_name: zabbix
+zabbix_database_user: zabbix
+
+zabbix_server_name: "MediaWiki monitoring"
+zabbix_server_timeout: 4
+zabbix_http_pollers: 5
+
+zabbix_apache_listen_address: "127.0.0.1"
+zabbix_apache_listen_port: 8080
+
+backup_files_source_host: "10.20.1.5"
+backup_files_source_directory: /var/www/mediawiki
+
+backup_database_host: "{{ postgresql_primary_ip }}"
+backup_database_name: "{{ mediawiki_database_name }}"
+
+backup_root_directory: /srv/mediawiki-data/backups
+backup_files_directory: /srv/mediawiki-data/backups/filesystem
+backup_database_directory: /srv/mediawiki-data/backups/database
+backup_retention_days: 14
+
+backup_ssh_user: ubuntu
+backup_ssh_key: /home/ubuntu/.ssh/mediawiki-backup
+backup_known_hosts: /home/ubuntu/.ssh/known_hosts
+
+backup_files_schedule: "*-*-* 02:00:00"
+backup_database_schedule: "*-*-* 00,06,12,18:00:00"
+
+mediawiki_public_url: "http://93.77.183.230"

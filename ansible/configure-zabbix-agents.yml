@@ -1,0 +1,44 @@
+---
+- name: Install and configure Zabbix agents on all project VMs
+  hosts: all
+  become: true
+
+  tasks:
+    - name: Copy Zabbix Agent package
+      ansible.builtin.copy:
+        src: /home/s26996103/mediawiki-project/zabbix-packages/zabbix-agent_1%3a7.0.31-1+ubuntu22.04_amd64.deb
+        dest: /tmp/zabbix-agent_7.0.31_ubuntu22.04_amd64.deb
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Install Zabbix Agent
+      ansible.builtin.apt:
+        deb: /tmp/zabbix-agent_7.0.31_ubuntu22.04_amd64.deb
+        state: present
+
+    - name: Allow checks from the Zabbix server
+      ansible.builtin.lineinfile:
+        path: /etc/zabbix/zabbix_agentd.conf
+        regexp: '^\s*#?\s*Server='
+        line: "Server=10.20.1.17,127.0.0.1"
+      notify: Restart Zabbix Agent
+
+    - name: Set the agent host name
+      ansible.builtin.lineinfile:
+        path: /etc/zabbix/zabbix_agentd.conf
+        regexp: '^\s*#?\s*Hostname='
+        line: "Hostname={{ inventory_hostname }}"
+      notify: Restart Zabbix Agent
+
+    - name: Enable and start Zabbix Agent
+      ansible.builtin.service:
+        name: zabbix-agent
+        state: started
+        enabled: true
+
+  handlers:
+    - name: Restart Zabbix Agent
+      ansible.builtin.service:
+        name: zabbix-agent
+        state: restarted

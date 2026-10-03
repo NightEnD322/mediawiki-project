@@ -1,0 +1,2 @@
+# Managed by Ansible
+{{ nfs_images_path }}{% for cidr in nfs_allowed_cidrs %} {{ cidr }}(rw,sync,no_subtree_check){% endfor %}

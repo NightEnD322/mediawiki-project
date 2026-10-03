@@ -1,0 +1,240 @@
+---
+- name: Validate PostgreSQL standby rebuild parameters
+  hosts: localhost
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Require explicit confirmation
+      ansible.builtin.assert:
+        that:
+          - confirm_rebuild | default(false) | bool
+          - postgresql_primary_host in postgresql_node_ips
+          - postgresql_standby_host in postgresql_node_ips
+          - postgresql_primary_host != postgresql_standby_host
+        fail_msg: >-
+          Пересоздание реплики не подтверждено. Добавь
+          -e confirm_rebuild=true только после проверки текущей топологии.
+        success_msg: >-
+          Подтверждено пересоздание {{ postgresql_standby_host }}
+          из {{ postgresql_primary_host }}.
+
+- name: Prepare the current PostgreSQL primary
+  hosts: database
+  become: true
+  tasks:
+    - name: Skip database nodes that are not the current primary
+      ansible.builtin.meta: end_host
+      when: inventory_hostname != postgresql_primary_host
+
+    - name: Verify that the configured primary is writable
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - -d
+          - postgres
+          - -tAc
+          - "SELECT pg_is_in_recovery()"
+      register: current_primary_recovery
+      changed_when: false
+      failed_when: current_primary_recovery.stdout | trim != "f"
+
+    - name: Allow replication from the configured standby
+      ansible.builtin.lineinfile:
+        path: "/etc/postgresql/{{ postgresql_version }}/{{ postgresql_cluster }}/pg_hba.conf"
+        line: >-
+          host replication {{ postgresql_replication_user }}
+          {{ postgresql_standby_ip }}/32 scram-sha-256
+        state: present
+      notify: Reload PostgreSQL
+
+    - name: Apply the replication access rule
+      ansible.builtin.meta: flush_handlers
+
+  handlers:
+    - name: Reload PostgreSQL
+      ansible.builtin.service:
+        name: postgresql
+        state: reloaded
+
+- name: Rebuild the configured PostgreSQL standby
+  hosts: database
+  become: true
+  tasks:
+    - name: Skip database nodes that are not the configured standby
+      ansible.builtin.meta: end_host
+      when: inventory_hostname != postgresql_standby_host
+
+    - name: Check the current recovery state
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - -d
+          - postgres
+          - -tAc
+          - "SELECT pg_is_in_recovery()"
+      register: current_standby_recovery
+      changed_when: false
+      failed_when: false
+
+    - name: Read the current primary connection information
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - -d
+          - postgres
+          - -tAc
+          - "SHOW primary_conninfo"
+      register: current_primary_conninfo
+      changed_when: false
+      failed_when: false
+
+    - name: Decide whether the standby must be rebuilt
+      ansible.builtin.set_fact:
+        standby_rebuild_required: >-
+          {{
+            current_standby_recovery.rc != 0 or
+            current_standby_recovery.stdout | trim != 't' or
+            postgresql_primary_ip not in current_primary_conninfo.stdout
+          }}
+
+    - name: Report the rebuild decision
+      ansible.builtin.debug:
+        msg: >-
+          {% if standby_rebuild_required %}
+          {{ inventory_hostname }} будет пересоздан из
+          {{ postgresql_primary_host }} ({{ postgresql_primary_ip }}).
+          {% else %}
+          {{ inventory_hostname }} уже является репликой текущего primary;
+          повторное удаление данных не требуется.
+          {% endif %}
+
+    - name: Stop PostgreSQL before rebuilding
+      ansible.builtin.service:
+        name: postgresql
+        state: stopped
+      when: standby_rebuild_required
+
+    - name: Configure PostgreSQL for standby operation
+      ansible.builtin.lineinfile:
+        path: "/etc/postgresql/{{ postgresql_version }}/{{ postgresql_cluster }}/postgresql.conf"
+        regexp: "^#?{{ item.key }}\\s*="
+        line: "{{ item.key }} = {{ item.value }}"
+      loop:
+        - { key: listen_addresses, value: "'*'" }
+        - { key: wal_level, value: replica }
+        - { key: max_wal_senders, value: "10" }
+        - { key: wal_keep_size, value: "'256MB'" }
+        - { key: hot_standby, value: "on" }
+
+    - name: Install the replication password file
+      ansible.builtin.copy:
+        dest: /var/lib/postgresql/.pgpass
+        content: "{{ postgresql_primary_ip }}:5432:replication:{{ postgresql_replication_user }}:{{ vault_replication_password }}\n"
+        owner: postgres
+        group: postgres
+        mode: "0600"
+      no_log: true
+
+    - name: Remove the old PostgreSQL data directory
+      ansible.builtin.file:
+        path: "/var/lib/postgresql/{{ postgresql_version }}/{{ postgresql_cluster }}"
+        state: absent
+      when: standby_rebuild_required
+
+    - name: Recreate the PostgreSQL data directory
+      ansible.builtin.file:
+        path: "/var/lib/postgresql/{{ postgresql_version }}/{{ postgresql_cluster }}"
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: "0700"
+      when: standby_rebuild_required
+
+    - name: Copy the current primary database to the standby
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - pg_basebackup
+          - "--host={{ postgresql_primary_ip }}"
+          - "--username={{ postgresql_replication_user }}"
+          - "--pgdata=/var/lib/postgresql/{{ postgresql_version }}/{{ postgresql_cluster }}"
+          - --format=plain
+          - --wal-method=stream
+          - --write-recovery-conf
+      environment:
+        PGPASSFILE: /var/lib/postgresql/.pgpass
+      when: standby_rebuild_required
+      no_log: true
+
+    - name: Enable and start PostgreSQL on the standby
+      ansible.builtin.service:
+        name: postgresql
+        state: started
+        enabled: true
+
+    - name: Verify that the standby is in recovery
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - -d
+          - postgres
+          - -tAc
+          - "SELECT pg_is_in_recovery()"
+      register: rebuilt_standby_recovery
+      changed_when: false
+      retries: 15
+      delay: 2
+      until: rebuilt_standby_recovery.stdout | trim == "t"
+
+- name: Verify PostgreSQL streaming replication
+  hosts: database
+  become: true
+  tasks:
+    - name: Skip database nodes that are not the current primary
+      ansible.builtin.meta: end_host
+      when: inventory_hostname != postgresql_primary_host
+
+    - name: Wait for the standby to enter streaming state
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - -d
+          - postgres
+          - -tAc
+          - >-
+            SELECT state FROM pg_stat_replication
+            WHERE client_addr = '{{ postgresql_standby_ip }}'
+      register: rebuilt_replication_state
+      changed_when: false
+      retries: 20
+      delay: 3
+      until: rebuilt_replication_state.stdout | trim == "streaming"
+
+    - name: Report successful replication
+      ansible.builtin.debug:
+        msg: >-
+          Репликация {{ postgresql_primary_host }} ->
+          {{ postgresql_standby_host }} работает в режиме streaming.

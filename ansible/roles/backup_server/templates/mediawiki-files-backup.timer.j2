@@ -1,0 +1,12 @@
+# Managed by Ansible.
+
+[Unit]
+Description=Daily MediaWiki filesystem backup
+
+[Timer]
+OnCalendar={{ backup_files_schedule }}
+Persistent=true
+Unit=mediawiki-backup@files.service
+
+[Install]
+WantedBy=timers.target

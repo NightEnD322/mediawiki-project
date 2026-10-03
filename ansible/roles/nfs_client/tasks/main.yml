@@ -1,0 +1,30 @@
+---
+- name: Install NFS client
+  ansible.builtin.apt:
+    name: nfs-common
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Create the MediaWiki images mount point
+  ansible.builtin.file:
+    path: "{{ nfs_client_mount }}"
+    state: directory
+
+- name: Mount the shared MediaWiki images directory
+  ansible.posix.mount:
+    path: "{{ nfs_client_mount }}"
+    src: "{{ nfs_server_ip }}:{{ nfs_images_path }}"
+    fstype: nfs4
+    opts: "{{ nfs_mount_options }}"
+    dump: "0"
+    passno: "0"
+    state: mounted
+
+- name: Verify the NFS mount
+  ansible.builtin.command:
+    argv:
+      - findmnt
+      - --mountpoint
+      - "{{ nfs_client_mount }}"
+  changed_when: false

@@ -1,0 +1,11 @@
+# Managed by Ansible.
+
+Listen {{ zabbix_apache_listen_address }}:{{ zabbix_apache_listen_port }}
+
+<IfModule ssl_module>
+    Listen 443
+</IfModule>
+
+<IfModule mod_gnutls.c>
+    Listen 443
+</IfModule>

@@ -1,0 +1,40 @@
+---
+- name: Configure PostgreSQL primary
+  hosts: database
+  become: true
+  tasks:
+    - name: Skip database nodes that are not the configured primary
+      ansible.builtin.meta: end_host
+      when: inventory_hostname != postgresql_primary_host
+    - name: Set PostgreSQL primary parameters
+      ansible.builtin.lineinfile:
+        path: "/etc/postgresql/{{ postgresql_version }}/{{ postgresql_cluster }}/postgresql.conf"
+        regexp: "^#?{{ item.key }}\\s*="
+        line: "{{ item.key }} = {{ item.value }}"
+      loop:
+        - { key: listen_addresses, value: "'*'" }
+        - { key: wal_level, value: replica }
+        - { key: max_wal_senders, value: "10" }
+        - { key: wal_keep_size, value: "'256MB'" }
+      notify: Restart PostgreSQL
+
+    - name: Allow application subnet connections
+      ansible.builtin.lineinfile:
+        path: "/etc/postgresql/{{ postgresql_version }}/{{ postgresql_cluster }}/pg_hba.conf"
+        line: "host {{ mediawiki_database_name }} {{ mediawiki_database_user }} {{ item }} scram-sha-256"
+        state: present
+      loop: "{{ postgresql_app_cidrs }}"
+      notify: Restart PostgreSQL
+
+    - name: Allow streaming replication from the configured standby
+      ansible.builtin.lineinfile:
+        path: "/etc/postgresql/{{ postgresql_version }}/{{ postgresql_cluster }}/pg_hba.conf"
+        line: "host replication {{ postgresql_replication_user }} {{ postgresql_standby_ip }}/32 scram-sha-256"
+        state: present
+      notify: Restart PostgreSQL
+
+  handlers:
+    - name: Restart PostgreSQL
+      ansible.builtin.service:
+        name: postgresql
+        state: restarted

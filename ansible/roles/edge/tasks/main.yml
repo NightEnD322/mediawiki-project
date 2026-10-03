@@ -1,0 +1,42 @@
+---
+- name: Install Nginx on edge-ops
+  ansible.builtin.apt:
+    name: nginx
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Deploy MediaWiki load balancer configuration
+  ansible.builtin.template:
+    src: mediawiki-lb.conf.j2
+    dest: /etc/nginx/sites-available/mediawiki-lb
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload edge Nginx
+
+- name: Enable MediaWiki load balancer site
+  ansible.builtin.file:
+    src: /etc/nginx/sites-available/mediawiki-lb
+    dest: /etc/nginx/sites-enabled/mediawiki-lb
+    state: link
+  notify: Reload edge Nginx
+
+- name: Disable the default Nginx site
+  ansible.builtin.file:
+    path: /etc/nginx/sites-enabled/default
+    state: absent
+  notify: Reload edge Nginx
+
+- name: Test Nginx configuration
+  ansible.builtin.command:
+    argv:
+      - nginx
+      - -t
+  changed_when: false
+
+- name: Enable and start Nginx
+  ansible.builtin.service:
+    name: nginx
+    state: started
+    enabled: true

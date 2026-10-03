@@ -1,0 +1,43 @@
+# Terraform working data
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+!*.tfvars.example
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Ansible temporary and password files
+*.retry
+.vault_pass
+vault-password*
+*.vault-pass
+
+# Private keys
+*.pem
+*.key
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+
+# Packages downloaded during manual bootstrap
+nfs-packages/
+zabbix-packages/
+
+# Editor and operating-system files
+*~
+*.swp
+*.swo
+.DS_Store
+
+# Deprecated playbooks kept only locally
+ansible/legacy/
+
+# Environment-specific Ansible Vault
+ansible/group_vars/all/vault.yml
