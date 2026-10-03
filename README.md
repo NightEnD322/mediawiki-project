@@ -4,6 +4,10 @@
 
 ## Архитектура
 
+[![Схема архитектуры MediaWiki](docs/mediawiki-architecture.png)](docs/mediawiki-architecture.drawio)
+
+Редактируемый исходник: [mediawiki-architecture.drawio](docs/mediawiki-architecture.drawio).
+
 | Узел | Внутренний IP | Зона | Назначение |
 |---|---|---|---|
 | edge-ops | 10.20.1.17 | ru-central1-a | Nginx load balancer, NFS, Zabbix, backups |
